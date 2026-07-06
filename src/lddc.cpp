@@ -31,6 +31,9 @@
 #include <iomanip>
 #include <math.h>
 #include <stdint.h>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 #include "include/ros_headers.h"
 
@@ -62,13 +65,20 @@ Lddc::Lddc(int format, int multi_topic, int data_src, int output_type,
 }
 #elif defined BUILDING_ROS2
 Lddc::Lddc(int format, int multi_topic, int data_src, int output_type,
-           double frq, std::string &frame_id)
+           double frq, std::string &frame_id, const RangeFilterConfig& range_filter,
+           const ScanConfig& scan_config, bool publish_pointcloud,
+           uint32_t pointcloud_qos_depth)
     : transfer_format_(format),
       use_multi_topic_(multi_topic),
       data_src_(data_src),
       output_type_(output_type),
       publish_frq_(frq),
-      frame_id_(frame_id) {
+      frame_id_(frame_id),
+      scan_pub_(nullptr),
+      range_filter_(range_filter),
+      scan_config_(scan_config),
+      publish_pointcloud_(publish_pointcloud),
+      pointcloud_qos_depth_(std::max<uint32_t>(1, pointcloud_qos_depth)) {
   publish_period_ns_ = kNsPerSecond / publish_frq_;
   lds_ = nullptr;
 #if 0
@@ -76,6 +86,20 @@ Lddc::Lddc(int format, int multi_topic, int data_src, int output_type,
 #endif
 }
 #endif
+
+void Lddc::SetRosNode(livox_ros::DriverNode *node) {
+  cur_node_ = node;
+#ifdef BUILDING_ROS2
+  if (cur_node_ && scan_config_.enabled) {
+    rclcpp::SensorDataQoS qos;
+    qos.keep_last(std::max<uint32_t>(1, scan_config_.qos_depth));
+    scan_pub_ = cur_node_->create_publisher<LaserScan>(scan_config_.topic, qos);
+    DRIVER_INFO(*cur_node_,
+        "%s publish use LaserScan format, best_effort, depth %u",
+        scan_config_.topic.c_str(), std::max<uint32_t>(1, scan_config_.qos_depth));
+  }
+#endif
+}
 
 Lddc::~Lddc() {
 #ifdef BUILDING_ROS1
@@ -207,10 +231,25 @@ void Lddc::PublishPointcloud2(LidarDataQueue *queue, uint8_t index) {
       continue;
     }
 
+    uint64_t timestamp = pkg.base_time;
+#ifdef BUILDING_ROS2
+    if (publish_pointcloud_) {
+      PointCloud2 cloud;
+      InitPointcloud2Msg(pkg, cloud, timestamp);
+      PublishPointcloud2Data(index, timestamp, cloud);
+    }
+#else
     PointCloud2 cloud;
-    uint64_t timestamp = 0;
     InitPointcloud2Msg(pkg, cloud, timestamp);
     PublishPointcloud2Data(index, timestamp, cloud);
+#endif
+#ifdef BUILDING_ROS2
+    if (scan_config_.enabled) {
+      LaserScan scan;
+      InitScanMsg(pkg, scan, timestamp);
+      PublishScanData(scan);
+    }
+#endif
   }
 }
 
@@ -222,6 +261,12 @@ void Lddc::PublishCustomPointcloud(LidarDataQueue *queue, uint8_t index) {
       printf("Publish custom point cloud failed, the pkg points is empty.\n");
       continue;
     }
+
+#ifdef BUILDING_ROS2
+    if (!publish_pointcloud_) {
+      continue;
+    }
+#endif
 
     CustomMsg livox_msg;
     InitCustomMsg(livox_msg, pkg, index);
@@ -249,6 +294,12 @@ void Lddc::PublishPclMsg(LidarDataQueue *queue, uint8_t index) {
       printf("Publish point cloud failed, the pkg points is empty.\n");
       continue;
     }
+
+#ifdef BUILDING_ROS2
+    if (!publish_pointcloud_) {
+      continue;
+    }
+#endif
 
     PointCloud cloud;
     uint64_t timestamp = 0;
@@ -300,9 +351,6 @@ void Lddc::InitPointcloud2Msg(const StoragePacket& pkg, PointCloud2& cloud, uint
 
   cloud.point_step = sizeof(LivoxPointXyzrtlt);
 
-  cloud.width = pkg.points_num;
-  cloud.row_step = cloud.width * cloud.point_step;
-
   cloud.is_bigendian = false;
   cloud.is_dense     = true;
 
@@ -317,7 +365,15 @@ void Lddc::InitPointcloud2Msg(const StoragePacket& pkg, PointCloud2& cloud, uint
   #endif
 
   std::vector<LivoxPointXyzrtlt> points;
-  for (size_t i = 0; i < pkg.points_num; ++i) {
+  const size_t points_num = std::min<size_t>(pkg.points_num, pkg.points.size());
+  points.reserve(points_num);
+  for (size_t i = 0; i < points_num; ++i) {
+#ifdef BUILDING_ROS2
+    if (range_filter_.enabled &&
+        !PointInHorizontalRange(pkg.points[i], range_filter_.min_range, range_filter_.max_range)) {
+      continue;
+    }
+#endif
     LivoxPointXyzrtlt point;
     point.x = pkg.points[i].x;
     point.y = pkg.points[i].y;
@@ -328,8 +384,12 @@ void Lddc::InitPointcloud2Msg(const StoragePacket& pkg, PointCloud2& cloud, uint
     point.timestamp = static_cast<double>(pkg.points[i].offset_time);
     points.push_back(std::move(point));
   }
-  cloud.data.resize(pkg.points_num * sizeof(LivoxPointXyzrtlt));
-  memcpy(cloud.data.data(), points.data(), pkg.points_num * sizeof(LivoxPointXyzrtlt));
+  cloud.width = points.size();
+  cloud.row_step = cloud.width * cloud.point_step;
+  cloud.data.resize(points.size() * sizeof(LivoxPointXyzrtlt));
+  if (!points.empty()) {
+    memcpy(cloud.data.data(), points.data(), points.size() * sizeof(LivoxPointXyzrtlt));
+  }
 }
 
 void Lddc::PublishPointcloud2Data(const uint8_t index, const uint64_t timestamp, const PointCloud2& cloud) {
@@ -350,6 +410,89 @@ void Lddc::PublishPointcloud2Data(const uint8_t index, const uint64_t timestamp,
 #endif
   }
 }
+
+#ifdef BUILDING_ROS2
+bool Lddc::PointInHorizontalRange(const PointXyzlt& point, double min_range, double max_range) const {
+  if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+    return false;
+  }
+  const double range_sq = static_cast<double>(point.x) * point.x +
+                          static_cast<double>(point.y) * point.y;
+  if (min_range > 0.0 && range_sq < min_range * min_range) {
+    return false;
+  }
+  if (max_range > 0.0 && range_sq > max_range * max_range) {
+    return false;
+  }
+  return true;
+}
+
+void Lddc::InitScanMsg(const StoragePacket& pkg, LaserScan& scan, uint64_t timestamp) {
+  scan.header.frame_id.assign(frame_id_);
+  scan.header.stamp = rclcpp::Time(timestamp);
+  scan.angle_min = static_cast<float>(scan_config_.angle_min);
+  scan.angle_max = static_cast<float>(scan_config_.angle_max);
+  scan.angle_increment = static_cast<float>(scan_config_.angle_increment);
+  scan.time_increment = 0.0;
+  scan.scan_time = static_cast<float>(
+      scan_config_.scan_time > 0.0 ? scan_config_.scan_time : 1.0 / publish_frq_);
+  scan.range_min = static_cast<float>(scan_config_.range_min);
+  scan.range_max = static_cast<float>(scan_config_.range_max);
+
+  const double angle_span = scan_config_.angle_max - scan_config_.angle_min;
+  const size_t bins = angle_span > 0.0 && scan_config_.angle_increment > 0.0
+      ? static_cast<size_t>(std::ceil(angle_span / scan_config_.angle_increment))
+      : 0;
+  const float empty_value = scan_config_.use_inf
+      ? std::numeric_limits<float>::infinity()
+      : static_cast<float>(scan_config_.range_max + 1.0);
+  scan.ranges.assign(bins, empty_value);
+
+  const size_t points_num = std::min<size_t>(pkg.points_num, pkg.points.size());
+  for (size_t i = 0; i < points_num; ++i) {
+    const PointXyzlt& point = pkg.points[i];
+    if (scan_config_.min_z < scan_config_.max_z &&
+        (point.z < scan_config_.min_z || point.z > scan_config_.max_z)) {
+      continue;
+    }
+    if (scan_config_.self_filter_enabled &&
+        point.x >= scan_config_.self_filter_min_x &&
+        point.x <= scan_config_.self_filter_max_x &&
+        point.y >= scan_config_.self_filter_min_y &&
+        point.y <= scan_config_.self_filter_max_y) {
+      continue;
+    }
+    if (!PointInHorizontalRange(point, scan_config_.range_min, scan_config_.range_max)) {
+      continue;
+    }
+
+    const double range = std::hypot(point.x, point.y);
+    const double angle = std::atan2(point.y, point.x);
+    if (angle < scan_config_.angle_min || angle > scan_config_.angle_max) {
+      continue;
+    }
+
+    size_t bin = static_cast<size_t>((angle - scan_config_.angle_min) / scan_config_.angle_increment);
+    if (bin >= scan.ranges.size()) {
+      if (angle <= scan_config_.angle_max && !scan.ranges.empty()) {
+        bin = scan.ranges.size() - 1;
+      } else {
+        continue;
+      }
+    }
+
+    if (range < scan.ranges[bin]) {
+      scan.ranges[bin] = static_cast<float>(range);
+    }
+  }
+}
+
+void Lddc::PublishScanData(const LaserScan& scan) {
+  if (kOutputToRos == output_type_ && scan_pub_) {
+    scan_pub_->publish(scan);
+  }
+}
+#endif
 
 void Lddc::InitCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg, uint8_t index) {
   livox_msg.header.frame_id.assign(frame_id_);
@@ -528,8 +671,11 @@ std::shared_ptr<rclcpp::PublisherBase> Lddc::CreatePublisher(uint8_t msg_type,
     std::string &topic_name, uint32_t queue_size) {
     if (kPointCloud2Msg == msg_type) {
       DRIVER_INFO(*cur_node_,
-          "%s publish use PointCloud2 format", topic_name.c_str());
-      return cur_node_->create_publisher<PointCloud2>(topic_name, queue_size);
+          "%s publish use PointCloud2 format, best_effort, depth %u",
+          topic_name.c_str(), pointcloud_qos_depth_);
+      rclcpp::SensorDataQoS qos;
+      qos.keep_last(pointcloud_qos_depth_);
+      return cur_node_->create_publisher<PointCloud2>(topic_name, qos);
     } else if (kLivoxCustomMsg == msg_type) {
       DRIVER_INFO(*cur_node_,
           "%s publish use livox custom format", topic_name.c_str());

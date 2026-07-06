@@ -63,11 +63,40 @@ using PointField = sensor_msgs::msg::PointField;
 using CustomMsg = livox_ros_driver2::msg::CustomMsg;
 using CustomPoint = livox_ros_driver2::msg::CustomPoint;
 using ImuMsg = sensor_msgs::msg::Imu;
+using LaserScan = sensor_msgs::msg::LaserScan;
 #endif
 
 using PointCloud = pcl::PointCloud<pcl::PointXYZI>;
 
 class DriverNode;
+
+#ifdef BUILDING_ROS2
+struct RangeFilterConfig {
+  bool enabled = false;
+  double min_range = 0.0;
+  double max_range = 0.0;
+};
+
+struct ScanConfig {
+  bool enabled = false;
+  std::string topic = "/livox/scan";
+  double angle_min = -3.14159265358979323846;
+  double angle_max = 3.14159265358979323846;
+  double angle_increment = 0.00872664625997164788;
+  double scan_time = 0.0;
+  double range_min = 0.2;
+  double range_max = 8.0;
+  double min_z = -1000.0;
+  double max_z = 1000.0;
+  bool self_filter_enabled = false;
+  double self_filter_min_x = 0.0;
+  double self_filter_max_x = 0.0;
+  double self_filter_min_y = 0.0;
+  double self_filter_max_y = 0.0;
+  bool use_inf = true;
+  uint32_t qos_depth = 5;
+};
+#endif
 
 class Lddc final {
  public:
@@ -76,7 +105,9 @@ class Lddc final {
       std::string &frame_id, bool lidar_bag, bool imu_bag);
 #elif defined BUILDING_ROS2
   Lddc(int format, int multi_topic, int data_src, int output_type, double frq,
-      std::string &frame_id);
+      std::string &frame_id, const RangeFilterConfig& range_filter,
+      const ScanConfig& scan_config, bool publish_pointcloud,
+      uint32_t pointcloud_qos_depth);
 #endif
   ~Lddc();
 
@@ -88,7 +119,7 @@ class Lddc final {
 
   uint8_t GetTransferFormat(void) { return transfer_format_; }
   uint8_t IsMultiTopic(void) { return use_multi_topic_; }
-  void SetRosNode(livox_ros::DriverNode *node) { cur_node_ = node; }
+  void SetRosNode(livox_ros::DriverNode *node);
 
   // void SetRosPub(ros::Publisher *pub) { global_pub_ = pub; };  // NOT USED
   void SetPublishFrq(uint32_t frq) { publish_frq_ = frq; }
@@ -109,6 +140,12 @@ class Lddc final {
   void InitPointcloud2MsgHeader(PointCloud2& cloud);
   void InitPointcloud2Msg(const StoragePacket& pkg, PointCloud2& cloud, uint64_t& timestamp);
   void PublishPointcloud2Data(const uint8_t index, uint64_t timestamp, const PointCloud2& cloud);
+
+#ifdef BUILDING_ROS2
+  bool PointInHorizontalRange(const PointXyzlt& point, double min_range, double max_range) const;
+  void InitScanMsg(const StoragePacket& pkg, LaserScan& scan, uint64_t timestamp);
+  void PublishScanData(const LaserScan& scan);
+#endif
 
   void InitCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg, uint8_t index);
   void FillPointsToCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg);
@@ -153,6 +190,11 @@ class Lddc final {
   PublisherPtr global_pub_;
   PublisherPtr private_imu_pub_[kMaxSourceLidar];
   PublisherPtr global_imu_pub_;
+  Publisher<LaserScan>::SharedPtr scan_pub_;
+  RangeFilterConfig range_filter_;
+  ScanConfig scan_config_;
+  bool publish_pointcloud_;
+  uint32_t pointcloud_qos_depth_;
 #endif
 
   livox_ros::DriverNode *cur_node_;
