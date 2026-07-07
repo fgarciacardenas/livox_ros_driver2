@@ -134,6 +134,8 @@ DriverNode::DriverNode(const rclcpp::NodeOptions & node_options)
   int pointcloud_qos_depth = 5;
   bool publish_scan = false;
   std::string scan_topic;
+  double scan_fov_deg = 360.0;
+  double scan_center_deg = 0.0;
   double scan_angle_min = -3.14159265358979323846;
   double scan_angle_max = 3.14159265358979323846;
   double scan_angle_increment = 0.00872664625997164788;
@@ -163,6 +165,8 @@ DriverNode::DriverNode(const rclcpp::NodeOptions & node_options)
   this->declare_parameter("pointcloud_qos_depth", 5);
   this->declare_parameter("publish_scan", false);
   this->declare_parameter("scan_topic", "/livox/scan");
+  this->declare_parameter("scan_fov_deg", 360.0);
+  this->declare_parameter("scan_center_deg", 0.0);
   this->declare_parameter("scan_angle_min", -3.14159265358979323846);
   this->declare_parameter("scan_angle_max", 3.14159265358979323846);
   this->declare_parameter("scan_angle_increment", 0.00872664625997164788);
@@ -195,6 +199,8 @@ DriverNode::DriverNode(const rclcpp::NodeOptions & node_options)
   this->get_parameter("pointcloud_qos_depth", pointcloud_qos_depth);
   this->get_parameter("publish_scan", publish_scan);
   this->get_parameter("scan_topic", scan_topic);
+  this->get_parameter("scan_fov_deg", scan_fov_deg);
+  this->get_parameter("scan_center_deg", scan_center_deg);
   this->get_parameter("scan_angle_min", scan_angle_min);
   this->get_parameter("scan_angle_max", scan_angle_max);
   this->get_parameter("scan_angle_increment", scan_angle_increment);
@@ -227,6 +233,18 @@ DriverNode::DriverNode(const rclcpp::NodeOptions & node_options)
   }
   if (scan_range_min < 0.0) {
     scan_range_min = 0.0;
+  }
+  if (scan_fov_deg > 0.0) {
+    const double pi = 3.14159265358979323846;
+    if (scan_fov_deg >= 360.0) {
+      scan_angle_min = -pi;
+      scan_angle_max = pi;
+    } else {
+      const double center_rad = scan_center_deg * pi / 180.0;
+      const double half_fov_rad = scan_fov_deg * pi / 360.0;
+      scan_angle_min = center_rad - half_fov_rad;
+      scan_angle_max = center_rad + half_fov_rad;
+    }
   }
   if (scan_angle_increment <= 0.0) {
     scan_angle_increment = 0.00872664625997164788;

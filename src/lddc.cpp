@@ -467,7 +467,14 @@ void Lddc::InitScanMsg(const StoragePacket& pkg, LaserScan& scan, uint64_t times
     }
 
     const double range = std::hypot(point.x, point.y);
-    const double angle = std::atan2(point.y, point.x);
+    double angle = std::atan2(point.y, point.x);
+    const double two_pi = 2.0 * 3.14159265358979323846;
+    while (angle < scan_config_.angle_min) {
+      angle += two_pi;
+    }
+    while (angle > scan_config_.angle_max) {
+      angle -= two_pi;
+    }
     if (angle < scan_config_.angle_min || angle > scan_config_.angle_max) {
       continue;
     }
